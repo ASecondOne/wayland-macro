@@ -1,0 +1,14 @@
+{
+  "uuid": "wayland-macro-recorder@anotherone",
+  "name": "Wayland Macro Recorder",
+  "description": "Adds a top-bar macro recorder for GNOME Wayland with F4 recording and F5 playback through GNOME Shell virtual input devices.",
+  "shell-version": [
+    "49"
+  ],
+  "settings-schema": "org.gnome.shell.extensions.wayland-macro-recorder",
+  "version": 6,
+  "session-modes": [
+    "user"
+  ],
+  "url": "https://github.com/ASecondOne/wayland-macro"
+}

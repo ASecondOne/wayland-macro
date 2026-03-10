@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.wayland-macro-recorder" path="/org/gnome/shell/extensions/wayland-macro-recorder/">
+    <key name="record-shortcut" type="as">
+      <default><![CDATA[['F4']]]></default>
+      <summary>Record shortcut</summary>
+      <description>Keyboard shortcut used to start or stop macro recording.</description>
+    </key>
+    <key name="playback-shortcut" type="as">
+      <default><![CDATA[['F5']]]></default>
+      <summary>Playback shortcut</summary>
+      <description>Keyboard shortcut used to start or stop playback of the last recorded macro.</description>
+    </key>
+  </schema>
+</schemalist>
