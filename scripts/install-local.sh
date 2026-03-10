@@ -7,12 +7,12 @@ TARGET_DIR="${HOME}/.local/share/gnome-shell/extensions/${UUID}"
 BUNDLE_DIR="${ROOT_DIR}/build"
 BUNDLE_PATH="${BUNDLE_DIR}/${UUID}.shell-extension.zip"
 SCHEMA_PATH="schemas/org.gnome.shell.extensions.wayland-macro-recorder.gschema.xml"
-HELPER_SOURCE="${ROOT_DIR}/native/evdev-recorder-helper.c"
+HELPER_SOURCE="${ROOT_DIR}/native/evdev-recorder-helper.rs"
 HELPER_BINARY="${ROOT_DIR}/native/evdev-recorder-helper"
 
 glib-compile-schemas "${ROOT_DIR}/schemas"
 
-cc -O2 -Wall -Wextra -std=c11 \
+rustc --edition=2021 -O \
     -o "${HELPER_BINARY}" \
     "${HELPER_SOURCE}"
 

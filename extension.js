@@ -680,8 +680,8 @@ class RecordingGrab {
 
         const payload = {
             type: 'motion',
-            dx,
-            dy,
+            x: pointerX,
+            y: pointerY,
         }
 
         if (this._callbacks.onRecordedEvent)
@@ -914,7 +914,7 @@ class MacroIndicator extends PanelMenu.Button {
             const [pointerX, pointerY] = global.get_pointer()
 
             payload = {
-                ...payload,
+                type: 'motion',
                 x: pointerX,
                 y: pointerY,
             }
@@ -952,8 +952,6 @@ class MacroIndicator extends PanelMenu.Button {
         if (payload.type === 'motion' && delay === 0 && lastEvent?.type === 'motion') {
             lastEvent.x = payload.x
             lastEvent.y = payload.y
-            lastEvent.dx = payload.dx
-            lastEvent.dy = payload.dy
             this._lastRecordTimestampUsec = eventTimestampUsec
             this._syncUi()
             return
@@ -1041,8 +1039,6 @@ class MacroIndicator extends PanelMenu.Button {
                 lastEvent?.type === 'motion') {
                 lastEvent.x = normalizedEvent.x
                 lastEvent.y = normalizedEvent.y
-                lastEvent.dx = normalizedEvent.dx
-                lastEvent.dy = normalizedEvent.dy
                 continue
             }
 
@@ -1134,12 +1130,10 @@ class MacroIndicator extends PanelMenu.Button {
 
         switch (macroEvent.type) {
         case 'motion':
-            if (Number.isFinite(macroEvent.x) && Number.isFinite(macroEvent.y)) {
-                await this._movePointerToRecordedPosition(macroEvent.x, macroEvent.y)
-                return
-            }
+            if (!Number.isFinite(macroEvent.x) || !Number.isFinite(macroEvent.y))
+                throw new Error(_('Recorded pointer event has no usable position.'))
 
-            await inputController.movePointer(macroEvent.dx, macroEvent.dy)
+            await this._movePointerToRecordedPosition(macroEvent.x, macroEvent.y)
             return
         case 'button':
             if (macroEvent.state === BUTTON_PRESSED) {

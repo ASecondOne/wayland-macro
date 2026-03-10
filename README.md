@@ -23,7 +23,7 @@ Run:
 That script will:
 
 - compile the GSettings schema
-- compile the local input helper
+- compile the local Rust input helper
 - build a GNOME extension bundle in `build/`
 - install the bundle with `gnome-extensions install --force`
 - copy the helper into the installed extension directory
