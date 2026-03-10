@@ -60,7 +60,7 @@ class MacroRecorderPreferencesPage extends Adw.PreferencesPage {
 
         notesGroup.add(new Adw.ActionRow({
             title: _('Recording backend'),
-            subtitle: _('Recording uses a small local libei helper so global keys, including Super, are captured reliably on Wayland.'),
+            subtitle: _('Recording uses a small local evdev helper, so apps keep receiving your real input while the macro is captured.'),
         }))
 
         this._settings.connectObject(

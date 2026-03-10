@@ -7,8 +7,14 @@ TARGET_DIR="${HOME}/.local/share/gnome-shell/extensions/${UUID}"
 BUNDLE_DIR="${ROOT_DIR}/build"
 BUNDLE_PATH="${BUNDLE_DIR}/${UUID}.shell-extension.zip"
 SCHEMA_PATH="schemas/org.gnome.shell.extensions.wayland-macro-recorder.gschema.xml"
+HELPER_SOURCE="${ROOT_DIR}/native/evdev-recorder-helper.c"
+HELPER_BINARY="${ROOT_DIR}/native/evdev-recorder-helper"
 
 glib-compile-schemas "${ROOT_DIR}/schemas"
+
+cc -O2 -Wall -Wextra -std=c11 \
+    -o "${HELPER_BINARY}" \
+    "${HELPER_SOURCE}"
 
 mkdir -p "${BUNDLE_DIR}"
 
@@ -26,6 +32,8 @@ fi
 )
 
 gnome-extensions install --force "${BUNDLE_PATH}"
+mkdir -p "${TARGET_DIR}/native"
+install -m 755 "${HELPER_BINARY}" "${TARGET_DIR}/native/evdev-recorder-helper"
 gnome-extensions disable "${UUID}" >/dev/null 2>&1 || true
 
 if gnome-extensions enable "${UUID}" >/dev/null 2>&1; then

@@ -18,11 +18,16 @@ const KEY_PLAYBACK_SHORTCUT = 'playback-shortcut'
 
 const EVDEV_KEY_F4 = 62
 const EVDEV_KEY_F5 = 63
+const EVDEV_KEY_F1 = 59
+const EVDEV_KEY_F12 = 88
 
 const KEY_RELEASED = 0
 const KEY_PRESSED = 1
 const BUTTON_RELEASED = 0
 const BUTTON_PRESSED = 1
+const POINTER_TARGET_TOLERANCE = 1
+const POINTER_MAX_STEP = 96
+const POINTER_MAX_CORRECTION_ATTEMPTS = 64
 
 const GRAB_STATE_POINTER = 1
 const GRAB_STATE_KEYBOARD = 1 << 1
@@ -57,6 +62,14 @@ function formatEventCount(count) {
     return `${count} ${count === 1 ? _('event') : _('events')}`
 }
 
+function isIgnoredFunctionKey(keycode) {
+    return keycode >= EVDEV_KEY_F1 && keycode <= EVDEV_KEY_F12
+}
+
+function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value))
+}
+
 function toEvdevButtonCode(button) {
     switch (button) {
     case 1:
@@ -71,6 +84,48 @@ function toEvdevButtonCode(button) {
         return 276
     default:
         return button
+    }
+}
+
+function getEventCode(event) {
+    if (typeof event.get_event_code === 'function') {
+        const eventCode = event.get_event_code()
+        if (eventCode > 0)
+            return eventCode
+    }
+
+    return 0
+}
+
+function getKeyEventCode(event) {
+    const eventCode = getEventCode(event)
+    if (eventCode > 0)
+        return eventCode
+
+    return event.get_key_code()
+}
+
+function getButtonEventCode(event) {
+    const eventCode = getEventCode(event)
+    if (eventCode > 0)
+        return eventCode
+
+    return toEvdevButtonCode(event.get_button())
+}
+
+function getRelativeMotionDelta(event) {
+    if (typeof event.get_relative_motion !== 'function')
+        return null
+
+    try {
+        const relativeMotion = event.get_relative_motion()
+        if (!Array.isArray(relativeMotion))
+            return null
+
+        const [hasRelativeMotion, dx, dy] = relativeMotion
+        return hasRelativeMotion ? [dx, dy] : null
+    } catch (_error) {
+        return null
     }
 }
 
@@ -257,6 +312,123 @@ class MutterRemoteDesktopController {
     }
 }
 
+class EvdevRecordingSource {
+    constructor(helperPath, callbacks) {
+        this._helperPath = helperPath
+        this._callbacks = callbacks
+        this._process = null
+        this._stdout = null
+        this._stderr = null
+        this._cancellable = null
+        this._stopping = false
+    }
+
+    start() {
+        const launcher = new Gio.SubprocessLauncher({
+            flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+        })
+
+        this._stopping = false
+        this._cancellable = new Gio.Cancellable()
+        this._process = launcher.spawnv([this._helperPath])
+        this._stdout = new Gio.DataInputStream({
+            base_stream: this._process.get_stdout_pipe(),
+            close_base_stream: true,
+        })
+        this._stderr = new Gio.DataInputStream({
+            base_stream: this._process.get_stderr_pipe(),
+            close_base_stream: true,
+        })
+
+        this._readStdout()
+        this._readStderr()
+        this._waitForExit()
+    }
+
+    stop() {
+        this._stopping = true
+
+        if (this._cancellable) {
+            this._cancellable.cancel()
+            this._cancellable = null
+        }
+
+        if (this._process) {
+            this._process.force_exit()
+            this._process = null
+        }
+
+        this._stdout = null
+        this._stderr = null
+    }
+
+    destroy() {
+        this.stop()
+    }
+
+    _readStdout() {
+        this._readLine(this._stdout, line => {
+            let payload
+
+            try {
+                payload = JSON.parse(line)
+            } catch (error) {
+                this._callbacks.onError?.(new Error(`Invalid recorder output: ${describeError(error)}`))
+                return
+            }
+
+            this._callbacks.onRecordedEvent?.(payload)
+        })
+    }
+
+    _readStderr() {
+        this._readLine(this._stderr, line => {
+            if (!this._stopping && line.length > 0)
+                this._callbacks.onError?.(new Error(line))
+        })
+    }
+
+    _readLine(stream, onLine) {
+        if (!stream || !this._cancellable)
+            return
+
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, this._cancellable, (source, result) => {
+            let line
+
+            try {
+                ;[line] = source.read_line_finish_utf8(result)
+            } catch (error) {
+                if (!this._stopping && !error.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    this._callbacks.onError?.(error)
+                return
+            }
+
+            if (line === null)
+                return
+
+            onLine(line)
+            this._readLine(stream, onLine)
+        })
+    }
+
+    _waitForExit() {
+        if (!this._process)
+            return
+
+        this._process.wait_check_async(this._cancellable, (process, result) => {
+            try {
+                process.wait_check_finish(result)
+            } catch (error) {
+                if (!this._stopping && !error.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    this._callbacks.onError?.(error)
+            } finally {
+                if (this._process === process)
+                    this._process = null
+            }
+        })
+    }
+}
+
 class RecordingGrab {
     constructor(inputController, callbacks) {
         this._inputController = inputController
@@ -266,6 +438,8 @@ class RecordingGrab {
         this._lastPointerX = null
         this._lastPointerY = null
         this._stopOnF4Release = false
+        this._pressedKeycodes = new Set()
+        this._pressedButtonCodes = new Set()
 
         this._actor = new St.Widget({
             reactive: true,
@@ -289,6 +463,8 @@ class RecordingGrab {
         this._syncGeometry()
         this._actor.show()
         this._grabSeat()
+        this._pressedKeycodes.clear()
+        this._pressedButtonCodes.clear()
 
         this._actor.grab_key_focus()
 
@@ -301,6 +477,8 @@ class RecordingGrab {
         this._stopOnF4Release = false
         this._removePendingRegrab()
         this._dismissGrab()
+        this._pressedKeycodes.clear()
+        this._pressedButtonCodes.clear()
 
         this._actor.hide()
         this._lastPointerX = null
@@ -413,7 +591,7 @@ class RecordingGrab {
     }
 
     _handleKeyEvent(event) {
-        const keycode = event.get_key_code()
+        const keycode = getKeyEventCode(event)
         const isPress = event.type() === Clutter.EventType.KEY_PRESS
         const isRepeated = (event.get_flags() & EVENT_FLAG_REPEATED) !== 0
 
@@ -432,6 +610,15 @@ class RecordingGrab {
         if (keycode === EVDEV_KEY_F5 || isRepeated)
             return Clutter.EVENT_STOP
 
+        if (isPress) {
+            if (this._pressedKeycodes.has(keycode))
+                return Clutter.EVENT_STOP
+
+            this._pressedKeycodes.add(keycode)
+        } else if (!this._pressedKeycodes.delete(keycode)) {
+            return Clutter.EVENT_STOP
+        }
+
         const payload = {
             type: 'key',
             keycode,
@@ -448,12 +635,22 @@ class RecordingGrab {
     }
 
     _handleButtonEvent(event) {
+        const buttonCode = getButtonEventCode(event)
+        const isPress = event.type() === Clutter.EventType.BUTTON_PRESS
+
+        if (isPress) {
+            if (this._pressedButtonCodes.has(buttonCode))
+                return Clutter.EVENT_STOP
+
+            this._pressedButtonCodes.add(buttonCode)
+        } else if (!this._pressedButtonCodes.delete(buttonCode)) {
+            return Clutter.EVENT_STOP
+        }
+
         const payload = {
             type: 'button',
-            buttonCode: toEvdevButtonCode(event.get_button()),
-            state: event.type() === Clutter.EventType.BUTTON_PRESS
-                ? BUTTON_PRESSED
-                : BUTTON_RELEASED,
+            buttonCode,
+            state: isPress ? BUTTON_PRESSED : BUTTON_RELEASED,
         }
 
         if (this._callbacks.onRecordedEvent)
@@ -467,14 +664,19 @@ class RecordingGrab {
 
     _handleMotionEvent(event) {
         const [pointerX, pointerY] = event.get_coords()
-        const dx = this._lastPointerX === null ? 0 : pointerX - this._lastPointerX
-        const dy = this._lastPointerY === null ? 0 : pointerY - this._lastPointerY
+        const relativeMotion = getRelativeMotionDelta(event)
+        const dx = relativeMotion
+            ? relativeMotion[0]
+            : (this._lastPointerX === null ? 0 : pointerX - this._lastPointerX)
+        const dy = relativeMotion
+            ? relativeMotion[1]
+            : (this._lastPointerY === null ? 0 : pointerY - this._lastPointerY)
 
-        this._lastPointerX = pointerX
-        this._lastPointerY = pointerY
-
-        if (dx === 0 && dy === 0)
+        if (dx === 0 && dy === 0) {
+            this._lastPointerX = pointerX
+            this._lastPointerY = pointerY
             return Clutter.EVENT_STOP
+        }
 
         const payload = {
             type: 'motion',
@@ -485,8 +687,11 @@ class RecordingGrab {
         if (this._callbacks.onRecordedEvent)
             this._callbacks.onRecordedEvent(payload)
 
-        void this._inputController.movePointer(dx, dy)
-            .catch(error => this._callbacks.onError?.(error))
+        // Reinjecting motion while the real device is already moving the cursor
+        // causes doubled movement and visible sway during recording.
+        this._lastPointerX = pointerX
+        this._lastPointerY = pointerY
+
         return Clutter.EVENT_STOP
     }
 }
@@ -497,18 +702,23 @@ class MacroIndicator extends PanelMenu.Button {
         super._init(0.0, _('Wayland Macro Recorder'))
 
         this._extension = extension
+        this._helperPath = GLib.build_filenamev([extension.path, 'native', 'evdev-recorder-helper'])
         this._settings = extension.getSettings()
         this._inputController = new MutterRemoteDesktopController(() => {
             if (this._status === STATUS.RECORDING || this._status === STATUS.PLAYING)
                 this._stopFromError(new Error(_('GNOME closed the virtual input session.')))
         })
-        this._recordingGrab = null
+        this._recordingSource = null
 
         this._status = STATUS.IDLE
         this._lastError = ''
         this._macroEvents = []
         this._lastRecordTimestampUsec = null
+        this._recordedPressedKeys = new Set()
+        this._recordedPressedButtons = new Set()
         this._playbackSerial = 0
+        this._playbackPressedKeys = new Set()
+        this._playbackPressedButtons = new Set()
         this._destroyed = false
 
         this.add_style_class_name('macro-panel-button')
@@ -653,19 +863,21 @@ class MacroIndicator extends PanelMenu.Button {
 
     async _startRecording() {
         try {
-            const inputController = await this._ensureInputController()
+            if (!GLib.file_test(this._helperPath, GLib.FileTest.IS_EXECUTABLE))
+                throw new Error(_('The local input helper is missing. Reinstall the extension with scripts/install-local.sh.'))
 
-            this._stopRecordingGrab()
+            this._stopRecordingSource()
             this._macroEvents = []
             this._lastRecordTimestampUsec = null
             this._lastError = ''
+            this._recordedPressedKeys.clear()
+            this._recordedPressedButtons.clear()
 
-            this._recordingGrab = new RecordingGrab(inputController, {
+            this._recordingSource = new EvdevRecordingSource(this._helperPath, {
                 onRecordedEvent: event => this._recordEvent(event),
-                onStopRequested: () => this._stopRecording(),
                 onError: error => this._stopFromError(error),
             })
-            this._recordingGrab.start()
+            this._recordingSource.start()
 
             this._status = STATUS.RECORDING
             this._syncUi()
@@ -677,25 +889,60 @@ class MacroIndicator extends PanelMenu.Button {
     _stopRecording() {
         const wasRecording = this._status === STATUS.RECORDING
 
-        this._stopRecordingGrab()
+        this._stopRecordingSource()
 
         if (!wasRecording || this._destroyed)
             return
 
+        this._recordedPressedKeys.clear()
+        this._recordedPressedButtons.clear()
         this._status = STATUS.IDLE
         this._lastError = ''
         this._syncUi()
     }
 
-    _stopRecordingGrab() {
-        if (!this._recordingGrab)
+    _stopRecordingSource() {
+        if (!this._recordingSource)
             return
 
-        this._recordingGrab.destroy()
-        this._recordingGrab = null
+        this._recordingSource.destroy()
+        this._recordingSource = null
     }
 
     _recordEvent(payload) {
+        if (payload.type === 'motion') {
+            const [pointerX, pointerY] = global.get_pointer()
+
+            payload = {
+                ...payload,
+                x: pointerX,
+                y: pointerY,
+            }
+        }
+
+        if (payload.type === 'key') {
+            if (isIgnoredFunctionKey(payload.keycode))
+                return
+
+            if (payload.state === KEY_PRESSED) {
+                if (this._recordedPressedKeys.has(payload.keycode))
+                    return
+
+                this._recordedPressedKeys.add(payload.keycode)
+            } else if (!this._recordedPressedKeys.delete(payload.keycode)) {
+                return
+            }
+        } else if (payload.type === 'button') {
+            if (payload.state === BUTTON_PRESSED) {
+                if (this._recordedPressedButtons.has(payload.buttonCode))
+                    return
+
+                this._recordedPressedButtons.add(payload.buttonCode)
+            } else if (!this._recordedPressedButtons.delete(payload.buttonCode)) {
+                return
+            }
+        }
+
         const eventTimestampUsec = GLib.get_monotonic_time()
         const delay = this._lastRecordTimestampUsec === null
             ? 0
@@ -703,8 +950,10 @@ class MacroIndicator extends PanelMenu.Button {
         const lastEvent = this._macroEvents[this._macroEvents.length - 1] ?? null
 
         if (payload.type === 'motion' && delay === 0 && lastEvent?.type === 'motion') {
-            lastEvent.dx += payload.dx
-            lastEvent.dy += payload.dy
+            lastEvent.x = payload.x
+            lastEvent.y = payload.y
+            lastEvent.dx = payload.dx
+            lastEvent.dy = payload.dy
             this._lastRecordTimestampUsec = eventTimestampUsec
             this._syncUi()
             return
@@ -723,18 +972,98 @@ class MacroIndicator extends PanelMenu.Button {
             return
 
         this._playbackSerial++
+        void this._releasePlaybackInputs()
         this._status = STATUS.IDLE
         this._lastError = ''
         this._syncUi()
     }
 
+    _getSanitizedMacroEvents() {
+        const sanitized = []
+        const pressedKeys = new Set()
+        const pressedButtons = new Set()
+        let carryDelay = 0
+
+        for (const macroEvent of this._macroEvents) {
+            const eventDelay = Math.max(0, macroEvent.delay ?? 0)
+            let keepEvent = true
+
+            switch (macroEvent.type) {
+            case 'motion':
+                keepEvent = Number.isFinite(macroEvent.x) && Number.isFinite(macroEvent.y)
+                break
+            case 'button':
+                if (macroEvent.state === BUTTON_PRESSED) {
+                    if (pressedButtons.has(macroEvent.buttonCode))
+                        keepEvent = false
+                    else
+                        pressedButtons.add(macroEvent.buttonCode)
+                } else if (!pressedButtons.delete(macroEvent.buttonCode)) {
+                    keepEvent = false
+                }
+                break
+            case 'key':
+                if (macroEvent.keycode <= 0 ||
+                    isIgnoredFunctionKey(macroEvent.keycode)) {
+                    keepEvent = false
+                    break
+                }
+
+                if (macroEvent.state === KEY_PRESSED) {
+                    if (pressedKeys.has(macroEvent.keycode))
+                        keepEvent = false
+                    else
+                        pressedKeys.add(macroEvent.keycode)
+                } else if (!pressedKeys.delete(macroEvent.keycode)) {
+                    keepEvent = false
+                }
+                break
+            default:
+                keepEvent = false
+                break
+            }
+
+            if (!keepEvent) {
+                carryDelay += eventDelay
+                continue
+            }
+
+            const normalizedEvent = {
+                ...macroEvent,
+                delay: eventDelay + carryDelay,
+            }
+            const lastEvent = sanitized[sanitized.length - 1] ?? null
+
+            carryDelay = 0
+
+            if (normalizedEvent.type === 'motion' &&
+                normalizedEvent.delay === 0 &&
+                lastEvent?.type === 'motion') {
+                lastEvent.x = normalizedEvent.x
+                lastEvent.y = normalizedEvent.y
+                lastEvent.dx = normalizedEvent.dx
+                lastEvent.dy = normalizedEvent.dy
+                continue
+            }
+
+            sanitized.push(normalizedEvent)
+        }
+
+        return sanitized
+    }
+
     async _startPlayback() {
-        if (this._macroEvents.length === 0) {
+        const macroEvents = this._getSanitizedMacroEvents()
+
+        if (macroEvents.length === 0) {
             Main.notifyError(
                 _('No macro recorded'),
                 _('Press F4 to record a macro before starting playback.'))
             return
         }
+
+        this._macroEvents = macroEvents
+        this._syncUi()
 
         try {
             await this._ensureInputController()
@@ -744,12 +1073,14 @@ class MacroIndicator extends PanelMenu.Button {
         }
 
         const serial = ++this._playbackSerial
+        this._playbackPressedKeys.clear()
+        this._playbackPressedButtons.clear()
         this._status = STATUS.PLAYING
         this._lastError = ''
         this._syncUi()
 
         try {
-            for (const macroEvent of this._macroEvents) {
+            for (const macroEvent of macroEvents) {
                 if (this._destroyed || serial !== this._playbackSerial)
                     return
 
@@ -764,6 +1095,8 @@ class MacroIndicator extends PanelMenu.Button {
             if (this._destroyed || serial !== this._playbackSerial)
                 return
 
+            await this._releasePlaybackInputs()
+
             this._status = STATUS.IDLE
             this._syncUi()
         } catch (error) {
@@ -774,18 +1107,63 @@ class MacroIndicator extends PanelMenu.Button {
         }
     }
 
+    async _movePointerToRecordedPosition(targetX, targetY) {
+        const inputController = this._inputController
+        const maxX = Math.max(0, global.stage.width - 1)
+        const maxY = Math.max(0, global.stage.height - 1)
+        const clampedTargetX = clamp(Math.round(targetX), 0, maxX)
+        const clampedTargetY = clamp(Math.round(targetY), 0, maxY)
+
+        for (let attempt = 0; attempt < POINTER_MAX_CORRECTION_ATTEMPTS; attempt++) {
+            const [currentX, currentY] = global.get_pointer()
+            const dx = clampedTargetX - currentX
+            const dy = clampedTargetY - currentY
+
+            if (Math.abs(dx) <= POINTER_TARGET_TOLERANCE &&
+                Math.abs(dy) <= POINTER_TARGET_TOLERANCE)
+                return
+
+            await inputController.movePointer(
+                clamp(dx, -POINTER_MAX_STEP, POINTER_MAX_STEP),
+                clamp(dy, -POINTER_MAX_STEP, POINTER_MAX_STEP))
+        }
+    }
+
     async _playMacroEvent(macroEvent) {
         const inputController = this._inputController
 
         switch (macroEvent.type) {
         case 'motion':
+            if (Number.isFinite(macroEvent.x) && Number.isFinite(macroEvent.y)) {
+                await this._movePointerToRecordedPosition(macroEvent.x, macroEvent.y)
+                return
+            }
+
             await inputController.movePointer(macroEvent.dx, macroEvent.dy)
             return
         case 'button':
+            if (macroEvent.state === BUTTON_PRESSED) {
+                if (this._playbackPressedButtons.has(macroEvent.buttonCode))
+                    return
+
+                this._playbackPressedButtons.add(macroEvent.buttonCode)
+            } else if (!this._playbackPressedButtons.delete(macroEvent.buttonCode)) {
+                return
+            }
+
             await inputController.notifyPointerButton(macroEvent.buttonCode, macroEvent.state)
             return
         case 'key':
             if (macroEvent.keycode > 0) {
+                if (macroEvent.state === KEY_PRESSED) {
+                    if (this._playbackPressedKeys.has(macroEvent.keycode))
+                        return
+
+                    this._playbackPressedKeys.add(macroEvent.keycode)
+                } else if (!this._playbackPressedKeys.delete(macroEvent.keycode)) {
+                    return
+                }
+
                 await inputController.notifyKeyboardKeycode(macroEvent.keycode, macroEvent.state)
                 return
             }
@@ -796,9 +1174,32 @@ class MacroIndicator extends PanelMenu.Button {
         }
     }
 
+    async _releasePlaybackInputs() {
+        if (this._playbackPressedButtons.size === 0 && this._playbackPressedKeys.size === 0)
+            return
+
+        const inputController = this._inputController
+
+        try {
+            for (const buttonCode of Array.from(this._playbackPressedButtons).reverse())
+                await inputController.notifyPointerButton(buttonCode, BUTTON_RELEASED)
+
+            for (const keycode of Array.from(this._playbackPressedKeys).reverse())
+                await inputController.notifyKeyboardKeycode(keycode, KEY_RELEASED)
+        } catch (error) {
+            logError(error, `${UUID}: failed to release playback inputs`)
+        } finally {
+            this._playbackPressedButtons.clear()
+            this._playbackPressedKeys.clear()
+        }
+    }
+
     _stopFromError(error) {
         this._playbackSerial++
-        this._stopRecordingGrab()
+        this._stopRecordingSource()
+        void this._releasePlaybackInputs()
+        this._recordedPressedKeys.clear()
+        this._recordedPressedButtons.clear()
         this._status = STATUS.ERROR
         this._lastError = describeError(error)
         this._syncUi()
@@ -849,7 +1250,8 @@ class MacroIndicator extends PanelMenu.Button {
     destroy() {
         this._destroyed = true
         this._playbackSerial++
-        this._stopRecordingGrab()
+        this._stopRecordingSource()
+        void this._releasePlaybackInputs()
         Main.wm.removeKeybinding(KEY_RECORD_SHORTCUT)
         Main.wm.removeKeybinding(KEY_PLAYBACK_SHORTCUT)
         this._settings.disconnectObject(this)
