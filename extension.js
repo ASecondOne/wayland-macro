@@ -1386,23 +1386,17 @@ class MacroIndicator extends PanelMenu.Button {
 
         switch (macroEvent.type) {
         case 'motion':
-            if (Number.isFinite(macroEvent.dx) &&
-                Number.isFinite(macroEvent.dy) &&
-                (macroEvent.dx !== 0 || macroEvent.dy !== 0)) {
+            if (Number.isFinite(macroEvent.x) && Number.isFinite(macroEvent.y)) {
+                await this._movePointerToRecordedPosition(macroEvent.x, macroEvent.y)
+                return
+            }
+
+            if (Number.isFinite(macroEvent.dx) && Number.isFinite(macroEvent.dy)) {
                 await inputController.movePointer(macroEvent.dx, macroEvent.dy)
                 return
             }
 
-            if (!Number.isFinite(macroEvent.x) || !Number.isFinite(macroEvent.y)) {
-                if (Number.isFinite(macroEvent.dx) && Number.isFinite(macroEvent.dy)) {
-                    await inputController.movePointer(macroEvent.dx, macroEvent.dy)
-                    return
-                }
-
-                throw new Error(_('Recorded pointer event has no usable position or delta.'))
-            }
-
-            await this._movePointerToRecordedPosition(macroEvent.x, macroEvent.y)
+            throw new Error(_('Recorded pointer event has no usable position or delta.'))
             return
         case 'button':
             if (macroEvent.state === BUTTON_PRESSED) {
