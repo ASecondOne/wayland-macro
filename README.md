@@ -34,5 +34,5 @@ That script will:
 
 - Red dot means recording. Blue dot means playback.
 - Recorded macros are stored in memory only. Reloading GNOME Shell or disabling the extension clears the current recording.
-- Pointer movement is recorded in screen coordinates and replay is corrected toward those recorded positions.
+- Pointer movement is recorded from raw evdev deltas, with screen coordinates kept when the cursor actually moves and relative playback used when a game captures or locks the pointer.
 - If GNOME Shell does not discover the new extension live, log out and back in once.

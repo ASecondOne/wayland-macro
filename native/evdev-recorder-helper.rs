@@ -1,15 +1,20 @@
+use std::env;
 use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::mem::{size_of, size_of_val};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::raw::{c_int, c_long, c_short, c_ulong};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::slice;
+use std::thread;
+use std::time::Duration;
 
 const INPUT_DIR: &str = "/dev/input";
+const UINPUT_PATH: &str = "/dev/uinput";
 const MAX_DEVICES: usize = 64;
+const UINPUT_MAX_NAME_SIZE: usize = 80;
 
 const O_NONBLOCK: i32 = 0o0004000;
 const O_CLOEXEC: i32 = 0o2000000;
@@ -50,6 +55,8 @@ const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
 const ABS_MAX: usize = 0x3f;
 
+const BUS_USB: u16 = 0x03;
+
 const IOC_NRBITS: c_ulong = 8;
 const IOC_TYPEBITS: c_ulong = 8;
 const IOC_SIZEBITS: c_ulong = 14;
@@ -57,6 +64,8 @@ const IOC_NRSHIFT: c_ulong = 0;
 const IOC_TYPESHIFT: c_ulong = IOC_NRSHIFT + IOC_NRBITS;
 const IOC_SIZESHIFT: c_ulong = IOC_TYPESHIFT + IOC_TYPEBITS;
 const IOC_DIRSHIFT: c_ulong = IOC_SIZESHIFT + IOC_SIZEBITS;
+const IOC_NONE: c_ulong = 0;
+const IOC_WRITE: c_ulong = 1;
 const IOC_READ: c_ulong = 2;
 
 const BITS_PER_LONG: usize = size_of::<c_ulong>() * 8;
@@ -83,6 +92,33 @@ struct PollFd {
     fd: c_int,
     events: c_short,
     revents: c_short,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct InputId {
+    bustype: u16,
+    vendor: u16,
+    product: u16,
+    version: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UInputSetup {
+    id: InputId,
+    name: [u8; UINPUT_MAX_NAME_SIZE],
+    ff_effects_max: u32,
+}
+
+impl Default for UInputSetup {
+    fn default() -> Self {
+        Self {
+            id: InputId::default(),
+            name: [0; UINPUT_MAX_NAME_SIZE],
+            ff_effects_max: 0,
+        }
+    }
 }
 
 struct Device {
@@ -123,9 +159,24 @@ const fn ioc(dir: c_ulong, ty: c_ulong, nr: c_ulong, size: c_ulong) -> c_ulong {
     (dir << IOC_DIRSHIFT) | (ty << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT) | (size << IOC_SIZESHIFT)
 }
 
+const fn io(ty: c_ulong, nr: c_ulong) -> c_ulong {
+    ioc(IOC_NONE, ty, nr, 0)
+}
+
+const fn iow(ty: c_ulong, nr: c_ulong, size: usize) -> c_ulong {
+    ioc(IOC_WRITE, ty, nr, size as c_ulong)
+}
+
 const fn eviocgbit(ev: c_ulong, len: usize) -> c_ulong {
     ioc(IOC_READ, b'E' as c_ulong, 0x20 + ev, len as c_ulong)
 }
+
+const UI_DEV_CREATE: c_ulong = io(b'U' as c_ulong, 1);
+const UI_DEV_DESTROY: c_ulong = io(b'U' as c_ulong, 2);
+const UI_DEV_SETUP: c_ulong = iow(b'U' as c_ulong, 3, size_of::<UInputSetup>());
+const UI_SET_EVBIT: c_ulong = iow(b'U' as c_ulong, 100, size_of::<c_int>());
+const UI_SET_KEYBIT: c_ulong = iow(b'U' as c_ulong, 101, size_of::<c_int>());
+const UI_SET_RELBIT: c_ulong = iow(b'U' as c_ulong, 102, size_of::<c_int>());
 
 fn test_bit(bit: usize, array: &[c_ulong]) -> bool {
     ((array[bit / BITS_PER_LONG] >> (bit % BITS_PER_LONG)) & 1) != 0
@@ -135,6 +186,33 @@ fn ioctl_get_bits(fd: RawFd, event_type: u16, bits: &mut [c_ulong], nbytes: usiz
     let request = eviocgbit(event_type as c_ulong, nbytes);
     let result = unsafe { ioctl(fd, request, bits.as_mut_ptr() as *mut c_void) };
     result >= 0
+}
+
+fn ioctl_no_arg(fd: RawFd, request: c_ulong) -> io::Result<()> {
+    let result = unsafe { ioctl(fd, request) };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn ioctl_with_int(fd: RawFd, request: c_ulong, value: c_int) -> io::Result<()> {
+    let result = unsafe { ioctl(fd, request, value) };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn ioctl_with_ref<T>(fd: RawFd, request: c_ulong, value: &T) -> io::Result<()> {
+    let result = unsafe { ioctl(fd, request, value as *const T) };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn has_event_type(fd: RawFd, event_type: u16) -> bool {
@@ -439,7 +517,171 @@ fn is_would_block(error: &io::Error) -> bool {
     error.kind() == ErrorKind::WouldBlock
 }
 
-fn run() -> Result<(), String> {
+struct VirtualPointerDevice {
+    file: File,
+}
+
+impl VirtualPointerDevice {
+    fn create() -> Result<Self, String> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_NONBLOCK | O_CLOEXEC)
+            .open(UINPUT_PATH)
+            .map_err(|error| format!("failed to open {UINPUT_PATH}: {error}"))?;
+        let fd = file.as_raw_fd();
+
+        for event_type in [EV_KEY, EV_REL] {
+            ioctl_with_int(fd, UI_SET_EVBIT, event_type as c_int)
+                .map_err(|error| format!("failed to configure virtual pointer: {error}"))?;
+        }
+
+        for button_code in [
+            BTN_LEFT,
+            BTN_RIGHT,
+            BTN_MIDDLE,
+            BTN_SIDE,
+            BTN_EXTRA,
+            BTN_FORWARD,
+            BTN_BACK,
+            BTN_TASK,
+        ] {
+            ioctl_with_int(fd, UI_SET_KEYBIT, button_code as c_int)
+                .map_err(|error| format!("failed to configure virtual pointer button: {error}"))?;
+        }
+
+        for rel_code in [REL_X, REL_Y] {
+            ioctl_with_int(fd, UI_SET_RELBIT, rel_code as c_int)
+                .map_err(|error| format!("failed to configure virtual pointer motion: {error}"))?;
+        }
+
+        let mut setup = UInputSetup::default();
+        setup.id = InputId {
+            bustype: BUS_USB,
+            vendor: 0x1f3d,
+            product: 0x1040,
+            version: 1,
+        };
+        let name = b"Wayland Macro Recorder Pointer";
+        setup.name[..name.len()].copy_from_slice(name);
+
+        ioctl_with_ref(fd, UI_DEV_SETUP, &setup)
+            .map_err(|error| format!("failed to setup virtual pointer: {error}"))?;
+        ioctl_no_arg(fd, UI_DEV_CREATE)
+            .map_err(|error| format!("failed to create virtual pointer: {error}"))?;
+
+        // Give the compositor a moment to register the new device.
+        thread::sleep(Duration::from_millis(50));
+
+        Ok(Self { file })
+    }
+
+    fn emit(&mut self, type_: u16, code: u16, value: i32) -> io::Result<()> {
+        let event = InputEvent {
+            time: TimeVal::default(),
+            type_,
+            code,
+            value,
+        };
+        let bytes = unsafe {
+            slice::from_raw_parts(
+                (&event as *const InputEvent).cast::<u8>(),
+                size_of::<InputEvent>(),
+            )
+        };
+
+        self.file.write_all(bytes)
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        self.emit(EV_SYN, SYN_REPORT, 0)
+    }
+
+    fn move_relative(&mut self, dx: i32, dy: i32) -> io::Result<()> {
+        if dx != 0 {
+            self.emit(EV_REL, REL_X, dx)?;
+        }
+
+        if dy != 0 {
+            self.emit(EV_REL, REL_Y, dy)?;
+        }
+
+        self.sync()
+    }
+
+    fn set_button(&mut self, button_code: u16, state: u32) -> io::Result<()> {
+        self.emit(EV_KEY, button_code, state as i32)?;
+        self.sync()
+    }
+}
+
+impl Drop for VirtualPointerDevice {
+    fn drop(&mut self) {
+        let _ = ioctl_no_arg(self.file.as_raw_fd(), UI_DEV_DESTROY);
+    }
+}
+
+enum PointerPlaybackCommand {
+    Motion(i32, i32),
+    Button(u16, u32),
+}
+
+fn parse_pointer_playback_command(line: &str) -> Result<Option<PointerPlaybackCommand>, String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    match parts.as_slice() {
+        ["motion", dx, dy] => {
+            let dx = dx
+                .parse::<i32>()
+                .map_err(|error| format!("invalid motion dx '{dx}': {error}"))?;
+            let dy = dy
+                .parse::<i32>()
+                .map_err(|error| format!("invalid motion dy '{dy}': {error}"))?;
+            Ok(Some(PointerPlaybackCommand::Motion(dx, dy)))
+        }
+        ["button", button_code, state] => {
+            let button_code = button_code
+                .parse::<u16>()
+                .map_err(|error| format!("invalid button code '{button_code}': {error}"))?;
+            let state = state
+                .parse::<u32>()
+                .map_err(|error| format!("invalid button state '{state}': {error}"))?;
+            Ok(Some(PointerPlaybackCommand::Button(button_code, state)))
+        }
+        _ => Err(format!("invalid playback command: {trimmed}")),
+    }
+}
+
+fn run_pointer_playback() -> Result<(), String> {
+    let stdin = io::stdin();
+    let reader = BufReader::new(stdin.lock());
+    let mut pointer_device = VirtualPointerDevice::create()?;
+
+    for line_result in reader.lines() {
+        let line =
+            line_result.map_err(|error| format!("failed to read playback command: {error}"))?;
+        let Some(command) = parse_pointer_playback_command(&line)? else {
+            continue;
+        };
+
+        match command {
+            PointerPlaybackCommand::Motion(dx, dy) => pointer_device
+                .move_relative(dx, dy)
+                .map_err(|error| format!("failed to emit pointer motion: {error}"))?,
+            PointerPlaybackCommand::Button(button_code, state) => pointer_device
+                .set_button(button_code, state)
+                .map_err(|error| format!("failed to emit pointer button: {error}"))?,
+        }
+    }
+
+    Ok(())
+}
+
+fn run_recorder() -> Result<(), String> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
 
@@ -559,7 +801,13 @@ fn run() -> Result<(), String> {
 }
 
 fn main() {
-    if let Err(error) = run() {
+    let result = match env::args().nth(1).as_deref() {
+        None => run_recorder(),
+        Some("--play-pointer") => run_pointer_playback(),
+        Some(argument) => Err(format!("unknown argument: {argument}")),
+    };
+
+    if let Err(error) = result {
         eprintln!("{error}");
         std::process::exit(1);
     }

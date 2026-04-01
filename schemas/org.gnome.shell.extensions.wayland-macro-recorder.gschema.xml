@@ -11,5 +11,10 @@
       <summary>Playback shortcut</summary>
       <description>Keyboard shortcut used to start or stop playback of the last recorded macro.</description>
     </key>
+    <key name="loop-playback" type="b">
+      <default>false</default>
+      <summary>Loop playback</summary>
+      <description>Whether playback should restart automatically until it is stopped.</description>
+    </key>
   </schema>
 </schemalist>
